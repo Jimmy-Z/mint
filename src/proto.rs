@@ -29,11 +29,11 @@ use aead::{generic_array::GenericArray, rand_core::RngCore};
 use bytes::{BufMut, Bytes, BytesMut, buf};
 use chacha20poly1305::{AeadCore, AeadInPlace, KeyInit, aead::OsRng};
 use log::*;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{copy, empty, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-// to do: don't hard encode
-const NONCE_LEN: usize = 12;
-const OVERHEAD_LEN: usize = 16;
+// to do: how to get these?
+const NONCE_SIZE: usize = 12;
+const OVERHEAD_SIZE: usize = 16;
 
 const EOH: &[u8] = b"\r\n\r\n";
 
@@ -136,7 +136,7 @@ fn write_msg<'a, C: AeadCore + AeadInPlace>(
 	let nonce = C::generate_nonce(&mut OsRng);
 	buf.put_slice(&nonce);
 
-	let len = (payload.len() + OVERHEAD_LEN) as u16;
+	let len = (payload.len() + OVERHEAD_SIZE) as u16;
 	buf.put_u16(len);
 	let payload_offset = buf.len();
 
@@ -166,14 +166,14 @@ fn read_msg<'a, C: AeadCore + AeadInPlace, T: Payload<'a>>(
 
 	let nonce_offset = eoh + EOH.len();
 
-	let len_offset = nonce_offset + NONCE_LEN;
+	let len_offset = nonce_offset + NONCE_SIZE;
 	let len = u16::from_be_bytes(buf[len_offset..len_offset + 2].try_into().unwrap());
 
 	// check length
 	let payload_offset = len_offset + 2;
 	let mut payload = buf.split_off(payload_offset);
 	if let Err(e) = cipher.decrypt_in_place(
-		&GenericArray::from_slice(&buf[nonce_offset..nonce_offset + NONCE_LEN]),
+		&GenericArray::from_slice(&buf[nonce_offset..nonce_offset + NONCE_SIZE]),
 		&buf[len_offset..len_offset + 2],
 		&mut payload,
 	) {
@@ -226,7 +226,11 @@ impl<'a> Payload<'a> for Req<'a> {
 			error!("invalid utf8 in host");
 			return None;
 		};
-		let port = u16::from_be_bytes(buf[2 + len as usize.. 2 + len as usize + 2].try_into().unwrap());
+		let port = u16::from_be_bytes(
+			buf[2 + len as usize..2 + len as usize + 2]
+				.try_into()
+				.unwrap(),
+		);
 		Some(Req(host, port))
 	}
 }
@@ -247,14 +251,124 @@ impl<'a> Payload<'a> for Resp {
 	}
 }
 
+async fn enc1<C: AeadCore + AeadInPlace, E: AsyncWrite + Unpin, P: AsyncRead + Unpin>(
+	buf: &mut BytesMut,
+	cipher: &C,
+	encrypted: &mut E, // the encrypted side
+	plain: &mut P,     // the plain side
+) -> Option<()> {
+	buf.clear();
+
+	let nonce = C::generate_nonce(&mut OsRng);
+	buf.put_slice(&nonce);
+
+	// we don't have length yet
+	buf.put_u16(0);
+	let payload_offset = buf.len();
+
+	if let Err(e) = plain.read_buf(buf).await {
+		error!("failed to read plain data: {}", e);
+		return None;
+	}
+	let mut payload = buf.split_off(payload_offset);
+	if payload.is_empty() {
+		buf.unsplit(payload);
+		return None;
+	}
+	if let Err(e) = cipher.encrypt_in_place(&nonce, b"", &mut payload) {
+		error!("failed to encrypt: {}", e);
+		return None;
+	}
+	// write length
+	(&mut buf[payload_offset - 2..]).copy_from_slice(&(payload.len() as u16).to_be_bytes());
+	buf.unsplit(payload);
+
+	encrypted
+		.write_all(buf)
+		.await
+		.map_err(|e| {
+			error!("failed to write encrypted data: {}", e);
+		})
+		.ok()
+}
+
+async fn dec1<C: AeadCore + AeadInPlace, P: AsyncWrite + Unpin, E: AsyncRead + Unpin>(
+	buf: &mut BytesMut,
+	cipher: &C,
+	plain: &mut P,     // the plain side
+	encrypted: &mut E, // the encrypted side
+) -> Option<()> {
+	let mut nonce = [0; NONCE_SIZE];
+	if let Err(e) = encrypted.read_exact(&mut nonce).await {
+		error!("failed to read nonce: {}", e);
+		return None;
+	}
+	let nonce = GenericArray::from_slice(&nonce);
+
+	let len = encrypted
+		.read_u16()
+		.await
+		.map_err(|e| error!("failed to read len: {}", e))
+		.ok()?;
+	if len == 0 {
+		error!("length = 0, unexpected");
+		return None;
+	}
+
+	buf.resize(len as usize, 0);
+
+	if let Err(e) = encrypted.read_exact(buf).await {
+		error!("failed to read payload: {}", e);
+		return None;
+	}
+
+	if let Err(e) = cipher.decrypt_in_place(&nonce, b"", buf) {
+		error!("failed to decrypt payload: {}", e);
+		return None;
+	}
+
+	plain
+		.write_all(buf)
+		.await
+		.map_err(|e| {
+			error!("failed to write decrypted payload: {}", e);
+		})
+		.ok()
+}
+
+pub async fn duplex<
+	C: AeadCore + AeadInPlace,
+	P: AsyncRead + AsyncWrite + Unpin,
+	E: AsyncRead + AsyncWrite + Unpin,
+>(
+	cipher: &C,
+	plain: &mut P,     // the plain side
+	encrypted: &mut E, // the encrypted side
+) {
+	let (mut p_r, mut p_w) = split(plain);
+	let (mut e_r, mut e_w) = split(encrypted);
+	tokio::join!(
+		async {
+			let mut buf = BytesMut::with_capacity(0x1000);
+			dec1(&mut buf, cipher, &mut p_w, &mut e_r).await;
+			drop(buf);
+			copy(&mut e_r, &mut p_w).await;
+		},
+		async {
+			let mut buf = BytesMut::with_capacity(0x1000);
+			enc1(&mut buf, cipher, &mut e_w, &mut p_r).await;
+			drop(buf);
+			copy(&mut p_r, &mut e_w).await;
+		}
+	);
+}
+
 #[cfg(test)]
 mod test {
 	use std::fmt::Write;
 
 	use bytes::BytesMut;
-	use chacha20poly1305::{
-		AeadCore, ChaCha20Poly1305, KeyInit, aead::OsRng,
-	};
+	use chacha20poly1305::{AeadCore, ChaCha20Poly1305, KeyInit, aead::OsRng};
 
 	use super::*;
 
@@ -271,7 +385,7 @@ mod test {
 		let cipher = ChaCha20Poly1305::new(&key);
 		let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
 		println!("nonce len: {}", nonce.len());
-		assert_eq!(nonce.len(), NONCE_LEN);
+		assert_eq!(nonce.len(), NONCE_SIZE);
 
 		let mut buf = BytesMut::with_capacity(1024);
 		let req = Req("example.com", 443);
@@ -306,5 +420,29 @@ mod test {
 				);
 			}
 		);
+	}
+
+	#[tokio::test]
+	async fn test_enc() {
+		init();
+
+		let key = ChaCha20Poly1305::generate_key(&mut OsRng);
+		let cipher = ChaCha20Poly1305::new(&key);
+
+		let mut buf = BytesMut::with_capacity(0x100);
+		let (mut b, mut a) = tokio::io::simplex(0x100);
+		let (mut d, mut c) = tokio::io::simplex(0x100);
+
+		let test_payload = b"you're (not) welcome.";
+		a.write_all(test_payload).await.unwrap();
+
+		enc1(&mut buf, &cipher, &mut c, &mut b).await.unwrap();
+
+		dec1(&mut buf, &cipher, &mut a, &mut d).await.unwrap();
+
+		buf.clear();
+		b.read_buf(&mut buf).await.unwrap();
+
+		assert_eq!(test_payload, &buf[..]);
 	}
 }

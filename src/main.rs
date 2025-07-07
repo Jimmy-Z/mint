@@ -83,7 +83,8 @@ async fn server(key: &str) -> Option<()> {
 			else {
 				return;
 			};
-			let _ = tokio::io::copy_bidirectional(&mut s, &mut u).await;
+			// let _ = tokio::io::copy_bidirectional(&mut s, &mut u).await;
+			duplex(&cipher, &mut u, &mut s).await;
 		});
 	}
 
@@ -117,7 +118,8 @@ async fn client(key: &str, upstream: &str) -> Option<()> {
 			else {
 				return;
 			};
-			let _ = tokio::io::copy_bidirectional(&mut s, &mut u).await;
+			// let _ = tokio::io::copy_bidirectional(&mut s, &mut u).await;
+			duplex(&cipher, &mut s, &mut u).await;
 		});
 	}
 
