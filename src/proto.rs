@@ -25,7 +25,7 @@
 	* 1 byte reply, 0 means succeed
 */
 
-use aead::generic_array::GenericArray;
+use aead::{generic_array::GenericArray, rand_core::RngCore};
 use bytes::{BufMut, Bytes, BytesMut, buf};
 use chacha20poly1305::{AeadCore, AeadInPlace, KeyInit, aead::OsRng};
 use log::*;
@@ -41,7 +41,7 @@ const VER: u8 = 0;
 const REP_OK: u8 = 0;
 
 pub fn fake_req_header() -> &'static [u8] {
-	b"POST /upload HTTP/1.1\r\nHOST: www.apple.com\r\n\r\n"
+	b"POST /upload HTTP/1.1\r\nHOST: www.douyin.com\r\n\r\n"
 }
 
 pub fn fake_resp_header() -> &'static [u8] {
@@ -141,10 +141,10 @@ fn write_msg<'a, C: AeadCore + AeadInPlace>(
 	let payload_offset = buf.len();
 
 	payload.write(&mut *buf);
+	buf.put_bytes(0x42, ((&mut OsRng).next_u32() & 0xff) as usize + 0x200);
 
 	let mut payload = buf.split_off(payload_offset);
 
-	// let cipher = ChaCha20Poly1305::new_from_slice(key).unwrap();
 	cipher
 		.encrypt_in_place(&nonce, &buf[payload_offset - 2..], &mut payload)
 		.unwrap();
@@ -172,7 +172,6 @@ fn read_msg<'a, C: AeadCore + AeadInPlace, T: Payload<'a>>(
 	// check length
 	let payload_offset = len_offset + 2;
 	let mut payload = buf.split_off(payload_offset);
-	// let cipher = ChaCha20Poly1305::new_from_slice(key).unwrap();
 	if let Err(e) = cipher.decrypt_in_place(
 		&GenericArray::from_slice(&buf[nonce_offset..nonce_offset + NONCE_LEN]),
 		&buf[len_offset..len_offset + 2],
@@ -215,9 +214,9 @@ impl<'a> Payload<'a> for Req<'a> {
 			return None;
 		}
 		let len = buf[1];
-		if buf.len() != 2 + len as usize + 2 {
+		if buf.len() < 2 + len as usize + 2 {
 			error!(
-				"invalid request length: {} != {}",
+				"invalid request length: {} < {}",
 				buf.len(),
 				2 + len as usize + 2
 			);
@@ -227,7 +226,7 @@ impl<'a> Payload<'a> for Req<'a> {
 			error!("invalid utf8 in host");
 			return None;
 		};
-		let port = u16::from_be_bytes(buf[2 + len as usize..].try_into().unwrap());
+		let port = u16::from_be_bytes(buf[2 + len as usize.. 2 + len as usize + 2].try_into().unwrap());
 		Some(Req(host, port))
 	}
 }
@@ -240,7 +239,7 @@ impl<'a> Payload<'a> for Resp {
 		buf.put_u8(self.0);
 	}
 	fn read(buf: &'a [u8]) -> Option<Self> {
-		if buf.len() != 1 {
+		if buf.len() < 1 {
 			error!("invalid response length");
 			return None;
 		}
