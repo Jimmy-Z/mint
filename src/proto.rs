@@ -1,4 +1,4 @@
-use aead::{AeadCore, AeadInPlace, KeyInit, OsRng as AeadOsRng, Nonce};
+use aead::{AeadCore, AeadInPlace, KeyInit, Nonce, OsRng as AeadOsRng};
 use bytes::{BufMut, BytesMut};
 use log::*;
 use rand::{Rng as _, TryRngCore as _, rngs::OsRng};
@@ -14,7 +14,6 @@ pub async fn client_handshake<
 	C: KeyInit + AeadCore + AeadInPlace,
 >(
 	io: &mut T,
-	// key: &[u8],
 	cipher: &C,
 	buf: &mut BytesMut,
 	host: &str,
@@ -42,7 +41,6 @@ pub async fn client_handshake<
 		return None;
 	}
 
-	// debug!("buf capacity: {}", buf.capacity());
 	Some(())
 }
 
@@ -51,7 +49,6 @@ pub async fn server_handshake<
 	C: KeyInit + AeadCore + AeadInPlace,
 >(
 	io: &mut T,
-	// key: &[u8],
 	cipher: &C,
 	buf: &mut BytesMut,
 	header: &[u8],
@@ -112,21 +109,19 @@ fn read_msg<'a, C: AeadCore + AeadInPlace, T: Payload<'a>>(
 	buf: &'a mut BytesMut,
 	cipher: &C,
 ) -> Option<T> {
-	debug!("read: {}", buf.len());
 	let Some(eoh) = buf.as_ref().windows(EOH.len()).position(|w| w == EOH) else {
-		error!("EoH not found, unexpected");
+		debug!("EoH not found, unexpected");
 		return None;
 	};
-	debug!("eoh: {}", eoh);
 
 	let nonce_offset = eoh + EOH.len();
 
 	let payload_offset = nonce_offset + nonce_size::<C>();
 	if buf.len() < payload_offset {
 		if buf.len() == nonce_offset {
-			error!("invalid msg, likely just HTTP");
+			debug!("invalid msg, likely just HTTP");
 		} else {
-			error!("invalid msg, no nonce");
+			debug!("invalid msg, no nonce");
 		}
 		return None;
 	}
@@ -136,7 +131,7 @@ fn read_msg<'a, C: AeadCore + AeadInPlace, T: Payload<'a>>(
 		b"",
 		&mut payload,
 	) {
-		error!("failed to decrypt message, likely invalid: {}", e);
+		debug!("failed to decrypt message, likely invalid: {}", e);
 		return None;
 	}
 	buf.unsplit(payload);
@@ -163,6 +158,10 @@ impl<'a> Payload<'a> for Req<'a> {
 		buf.put_u16(self.1);
 	}
 	fn read(buf: &'a [u8]) -> Option<Self> {
+		if buf.len() < 2 {
+			error!("invalid request length: {}", buf.len());
+			return None;
+		}
 		let ver = buf[0];
 		if ver != VER {
 			error!("invalid ver: 0x{:02x}", ver);
@@ -196,7 +195,7 @@ impl<'a> Payload<'a> for Resp {
 	}
 	fn read(buf: &'a [u8]) -> Option<Self> {
 		if buf.len() < 1 {
-			error!("invalid response length");
+			error!("invalid response length: {}", buf.len());
 			return None;
 		}
 		Some(Resp(buf[0]))
@@ -212,15 +211,15 @@ async fn enc1<C: AeadCore + AeadInPlace, E: AsyncWrite + Unpin, P: AsyncRead + U
 ) -> Option<()> {
 	buf.clear();
 
-	let nonce = C::generate_nonce(&mut AeadOsRng);
-	buf.put_slice(&nonce);
+	// we don't generate nonce at this point
+	buf.put_bytes(0, nonce_size::<C>());
 
 	// we don't have length yet
 	buf.put_u16(0);
 	let payload_offset = buf.len();
 
 	if let Err(e) = plain.read_buf(buf).await {
-		error!("failed to read plain data: {}", e);
+		debug!("failed to read plain data: {}", e);
 		return None;
 	}
 	let mut payload = buf.split_off(payload_offset);
@@ -228,21 +227,23 @@ async fn enc1<C: AeadCore + AeadInPlace, E: AsyncWrite + Unpin, P: AsyncRead + U
 		buf.unsplit(payload);
 		return None;
 	}
+
+	let nonce = C::generate_nonce(&mut AeadOsRng);
 	if let Err(e) = cipher.encrypt_in_place(&nonce, b"", &mut payload) {
 		error!("failed to encrypt: {}", e);
 		return None;
 	}
+	// write nonce
+	(&mut buf[..nonce_size::<C>()]).copy_from_slice(&nonce);
 	// write length
 	// to do: xor it with nonce to make it look random?
-	(&mut buf[payload_offset - 2..]).copy_from_slice(&(payload.len() as u16).to_be_bytes());
+	(&mut buf[nonce_size::<C>()..]).copy_from_slice(&(payload.len() as u16).to_be_bytes());
 	buf.unsplit(payload);
 
 	encrypted
 		.write_all(buf)
 		.await
-		.map_err(|e| {
-			error!("failed to write encrypted data: {}", e);
-		})
+		.inspect_err(|e| debug!("failed to write encrypted data: {}", e))
 		.ok()
 }
 
@@ -253,19 +254,19 @@ async fn dec1<C: AeadCore + AeadInPlace, P: AsyncWrite + Unpin, E: AsyncRead + U
 	plain: &mut P,
 	encrypted: &mut E,
 ) -> Option<()> {
-	let mut nonce: Nonce<C> = Default::default();
+	let mut nonce = Nonce::<C>::default();
 	if let Err(e) = encrypted.read_exact(&mut nonce).await {
-		error!("failed to read nonce: {}", e);
+		debug!("failed to read nonce: {}", e);
 		return None;
 	}
 
 	let len = encrypted
 		.read_u16()
 		.await
-		.map_err(|e| error!("failed to read len: {}", e))
+		.map_err(|e| debug!("failed to read len: {}", e))
 		.ok()?;
 	if len == 0 {
-		error!("length = 0, unexpected");
+		debug!("length = 0, unexpected");
 		return None;
 	}
 
@@ -304,17 +305,33 @@ pub async fn duplex<
 	tokio::join!(
 		async {
 			let mut buf = BytesMut::with_capacity(0x1000);
-			dec1(&mut buf, cipher, &mut p_w, &mut e_r).await;
+			dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
+			dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
+			dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
 			drop(buf);
-			copy(&mut e_r, &mut p_w).await;
-			p_w.shutdown().await;
+			copy(&mut e_r, &mut p_w)
+				.await
+				.inspect_err(|e| debug!("error copying: {}", e))
+				.ok()?;
+			p_w.shutdown()
+				.await
+				.inspect_err(|e| debug!("error shutting down: {}", e))
+				.ok()
 		},
 		async {
 			let mut buf = BytesMut::with_capacity(0x1000);
-			enc1(&mut buf, cipher, &mut e_w, &mut p_r).await;
+			enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
+			enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
+			enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
 			drop(buf);
-			copy(&mut p_r, &mut e_w).await;
-			e_w.shutdown().await;
+			copy(&mut p_r, &mut e_w)
+				.await
+				.inspect_err(|e| debug!("error copying: {}", e))
+				.ok()?;
+			e_w.shutdown()
+				.await
+				.inspect_err(|e| debug!("error shutting down: {}", e))
+				.ok()
 		}
 	);
 }

@@ -11,5 +11,5 @@ in an eye-balling test, it consumes about 1/3 CPU compared to stunnel under the 
 so far it's just a PoC.
 
 ### to do
- - [ ] timeout in handshake
- - [ ] 
+- timeout in handshake
+- timeout in socks5 handshake
