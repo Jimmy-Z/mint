@@ -9,7 +9,7 @@ strip = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-log = "*"
+log = { version = "*", features = ["release_max_level_debug"] }
 env_logger = "*"
 
 bytes = "1"
@@ -17,6 +17,8 @@ tokio = { version = "1", features = ["macros", "rt", "io-util", "net", "time"] }
 chacha20poly1305 = "*"
 aead = { version = "*", features = ["bytes"] }
 base64 = "*"
+
+socks5 = {path = "../socks5"}
 
 [dev-dependencies]
 rand = "*"
