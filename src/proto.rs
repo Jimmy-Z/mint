@@ -40,16 +40,8 @@ const EOH: &[u8] = b"\r\n\r\n";
 const VER: u8 = 0;
 const REP_OK: u8 = 0;
 
-pub fn fake_req_header() -> &'static [u8] {
-	b"POST /upload HTTP/1.1\r\nHOST: www.douyin.com\r\n\r\n"
-}
-
-pub fn fake_resp_header() -> &'static [u8] {
-	b"HTTP/1.1 200 OK\r\n\r\n"
-}
-
 pub fn nonce_size<T: AeadCore>() -> usize {
-	// T::NonceSize::len()
+	let a : T::NonceSize;
 	unimplemented!()
 }
 
@@ -353,12 +345,14 @@ pub async fn duplex<
 			dec1(&mut buf, cipher, &mut p_w, &mut e_r).await;
 			drop(buf);
 			copy(&mut e_r, &mut p_w).await;
+			p_w.shutdown().await;
 		},
 		async {
 			let mut buf = BytesMut::with_capacity(0x1000);
 			enc1(&mut buf, cipher, &mut e_w, &mut p_r).await;
 			drop(buf);
 			copy(&mut p_r, &mut e_w).await;
+			e_w.shutdown().await;
 		}
 	);
 }
@@ -375,6 +369,8 @@ mod test {
 	fn init() {
 		let _ = env_logger::builder().is_test(true).try_init();
 	}
+	
+	const FAKE_HEADER: &[u8] = b"\r\n\r\n";
 
 	#[test]
 	fn test_payload() {
@@ -389,7 +385,7 @@ mod test {
 
 		let mut buf = BytesMut::with_capacity(1024);
 		let req = Req("example.com", 443);
-		write_msg(&mut buf, &cipher, &fake_req_header(), &req);
+		write_msg(&mut buf, &cipher, FAKE_HEADER, &req);
 		let req_r: Req = read_msg(&mut buf, &cipher).unwrap();
 		assert_eq!(req, req_r);
 	}
@@ -400,7 +396,6 @@ mod test {
 
 		let (mut c, mut s) = tokio::io::duplex(0x500);
 
-		let header = &fake_req_header();
 		let key = ChaCha20Poly1305::generate_key(&mut OsRng);
 		let cipher = ChaCha20Poly1305::new(&key);
 
@@ -409,14 +404,14 @@ mod test {
 				let mut buf = BytesMut::with_capacity(0x500);
 				assert_eq!(
 					Some(()),
-					client_handshake(&mut c, &cipher, &mut buf, "example.com", 443, header).await
+					client_handshake(&mut c, &cipher, &mut buf, "example.com", 443, FAKE_HEADER).await
 				);
 			},
 			async {
 				let mut buf = BytesMut::with_capacity(0x500);
 				assert_eq!(
 					Some(("example.com".to_owned(), 443)),
-					server_handshake(&mut s, &cipher, &mut buf, header).await
+					server_handshake(&mut s, &cipher, &mut buf, FAKE_HEADER).await
 				);
 			}
 		);
