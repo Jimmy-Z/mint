@@ -1,49 +1,13 @@
-/*
-* general
-	* it's very much like SOCKS5.
-	* but handshake is encrypted with a PSK using ChaCha20Poly1305.
-	* once handshake is done, it's plain TCP just like SOCKS.
-	* handshake message (including padding) should not exceed 1280(0x500) bytes
-	* so it always arrive in one packet.
-	* message MUST be written in a single write call.
-* message format
-	* a fake header, ends with double CRLF
-	* to fake some protocols, for reasons
-	* 12 bytes random nonce
-	* 2 bytes _len_ of the encrypted part
-	* it's xor'ed with (the last two bytes of) nonce to make it look random
-	* not encrypted but authenticated as associate data
-	* encrypted payload
-	* request or response
-	* padding
-* request:
-	* 1 byte VER, 0
-	* 1 byte length of the host
-	* host
-	* 2 bytes dest port
-* response:
-	* 1 byte reply, 0 means succeed
-*/
-
-use aead::{generic_array::GenericArray, rand_core::RngCore};
-use bytes::{BufMut, Bytes, BytesMut, buf};
-use chacha20poly1305::{AeadCore, AeadInPlace, KeyInit, aead::OsRng};
+use aead::{AeadCore, AeadInPlace, KeyInit, OsRng as AeadOsRng, Nonce};
+use bytes::{BufMut, BytesMut};
 use log::*;
-use tokio::io::{copy, empty, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
-// to do: how to get these?
-const NONCE_SIZE: usize = 12;
-const OVERHEAD_SIZE: usize = 16;
+use rand::{Rng as _, TryRngCore as _, rngs::OsRng};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy, split};
 
 const EOH: &[u8] = b"\r\n\r\n";
 
 const VER: u8 = 0;
 const REP_OK: u8 = 0;
-
-pub fn nonce_size<T: AeadCore>() -> usize {
-	let a : T::NonceSize;
-	unimplemented!()
-}
 
 pub async fn client_handshake<
 	T: AsyncRead + AsyncWrite + Unpin,
@@ -118,58 +82,61 @@ pub async fn server_handshake<
 // can't be implemented on BufMut since we want encrypt in place
 fn write_msg<'a, C: AeadCore + AeadInPlace>(
 	buf: &mut BytesMut,
-	// key: &[u8],
 	cipher: &C,
 	header: &[u8],
 	payload: &impl Payload<'a>,
 ) {
 	buf.put_slice(header);
 
-	let nonce = C::generate_nonce(&mut OsRng);
+	let nonce = C::generate_nonce(&mut AeadOsRng);
 	buf.put_slice(&nonce);
 
-	let len = (payload.len() + OVERHEAD_SIZE) as u16;
-	buf.put_u16(len);
 	let payload_offset = buf.len();
 
 	payload.write(&mut *buf);
-	buf.put_bytes(0x42, ((&mut OsRng).next_u32() & 0xff) as usize + 0x200);
+
+	// padding
+	buf.put_bytes(
+		OsRng.unwrap_err().random(),
+		OsRng.unwrap_err().random_range(0x200..0x300),
+	);
 
 	let mut payload = buf.split_off(payload_offset);
 
-	cipher
-		.encrypt_in_place(&nonce, &buf[payload_offset - 2..], &mut payload)
-		.unwrap();
+	cipher.encrypt_in_place(&nonce, b"", &mut payload).unwrap();
 
 	buf.unsplit(payload);
 }
 
 fn read_msg<'a, C: AeadCore + AeadInPlace, T: Payload<'a>>(
 	buf: &'a mut BytesMut,
-	// key: &[u8],
 	cipher: &C,
 ) -> Option<T> {
 	debug!("read: {}", buf.len());
 	let Some(eoh) = buf.as_ref().windows(EOH.len()).position(|w| w == EOH) else {
-		error!("End of Header not found, unexpected");
+		error!("EoH not found, unexpected");
 		return None;
 	};
 	debug!("eoh: {}", eoh);
 
 	let nonce_offset = eoh + EOH.len();
 
-	let len_offset = nonce_offset + NONCE_SIZE;
-	let len = u16::from_be_bytes(buf[len_offset..len_offset + 2].try_into().unwrap());
-
-	// check length
-	let payload_offset = len_offset + 2;
+	let payload_offset = nonce_offset + nonce_size::<C>();
+	if buf.len() < payload_offset {
+		if buf.len() == nonce_offset {
+			error!("invalid msg, likely just HTTP");
+		} else {
+			error!("invalid msg, no nonce");
+		}
+		return None;
+	}
 	let mut payload = buf.split_off(payload_offset);
 	if let Err(e) = cipher.decrypt_in_place(
-		&GenericArray::from_slice(&buf[nonce_offset..nonce_offset + NONCE_SIZE]),
-		&buf[len_offset..len_offset + 2],
+		&Nonce::<C>::from_slice(&buf[nonce_offset..nonce_offset + nonce_size::<C>()]),
+		b"",
 		&mut payload,
 	) {
-		error!("failed to decrypt message: {}", e);
+		error!("failed to decrypt message, likely invalid: {}", e);
 		return None;
 	}
 	buf.unsplit(payload);
@@ -178,7 +145,6 @@ fn read_msg<'a, C: AeadCore + AeadInPlace, T: Payload<'a>>(
 }
 
 trait Payload<'a>: Sized {
-	fn len(&self) -> usize;
 	fn write(&self, buf: impl BufMut);
 	fn read(buf: &'a [u8]) -> Option<Self>;
 }
@@ -190,9 +156,6 @@ struct Req<'a>(&'a str, u16);
 struct Resp(u8);
 
 impl<'a> Payload<'a> for Req<'a> {
-	fn len(&self) -> usize {
-		1 + self.0.len() + 2
-	}
 	fn write(&self, mut buf: impl BufMut) {
 		buf.put_u8(VER);
 		buf.put_u8(self.0.len() as u8);
@@ -228,9 +191,6 @@ impl<'a> Payload<'a> for Req<'a> {
 }
 
 impl<'a> Payload<'a> for Resp {
-	fn len(&self) -> usize {
-		1
-	}
 	fn write(&self, mut buf: impl BufMut) {
 		buf.put_u8(self.0);
 	}
@@ -243,15 +203,16 @@ impl<'a> Payload<'a> for Resp {
 	}
 }
 
+// read once from the plain side, encrypt it, write it to the encrypted side
 async fn enc1<C: AeadCore + AeadInPlace, E: AsyncWrite + Unpin, P: AsyncRead + Unpin>(
 	buf: &mut BytesMut,
 	cipher: &C,
-	encrypted: &mut E, // the encrypted side
-	plain: &mut P,     // the plain side
+	encrypted: &mut E,
+	plain: &mut P,
 ) -> Option<()> {
 	buf.clear();
 
-	let nonce = C::generate_nonce(&mut OsRng);
+	let nonce = C::generate_nonce(&mut AeadOsRng);
 	buf.put_slice(&nonce);
 
 	// we don't have length yet
@@ -272,6 +233,7 @@ async fn enc1<C: AeadCore + AeadInPlace, E: AsyncWrite + Unpin, P: AsyncRead + U
 		return None;
 	}
 	// write length
+	// to do: xor it with nonce to make it look random?
 	(&mut buf[payload_offset - 2..]).copy_from_slice(&(payload.len() as u16).to_be_bytes());
 	buf.unsplit(payload);
 
@@ -284,18 +246,18 @@ async fn enc1<C: AeadCore + AeadInPlace, E: AsyncWrite + Unpin, P: AsyncRead + U
 		.ok()
 }
 
+// read one _packet_ from the encrypted side, decrypt it, write it to the plain side
 async fn dec1<C: AeadCore + AeadInPlace, P: AsyncWrite + Unpin, E: AsyncRead + Unpin>(
 	buf: &mut BytesMut,
 	cipher: &C,
-	plain: &mut P,     // the plain side
-	encrypted: &mut E, // the encrypted side
+	plain: &mut P,
+	encrypted: &mut E,
 ) -> Option<()> {
-	let mut nonce = [0; NONCE_SIZE];
+	let mut nonce: Nonce<C> = Default::default();
 	if let Err(e) = encrypted.read_exact(&mut nonce).await {
 		error!("failed to read nonce: {}", e);
 		return None;
 	}
-	let nonce = GenericArray::from_slice(&nonce);
 
 	let len = encrypted
 		.read_u16()
@@ -334,8 +296,8 @@ pub async fn duplex<
 	E: AsyncRead + AsyncWrite + Unpin,
 >(
 	cipher: &C,
-	plain: &mut P,     // the plain side
-	encrypted: &mut E, // the encrypted side
+	plain: &mut P,
+	encrypted: &mut E,
 ) {
 	let (mut p_r, mut p_w) = split(plain);
 	let (mut e_r, mut e_w) = split(encrypted);
@@ -357,10 +319,13 @@ pub async fn duplex<
 	);
 }
 
+// is there a less verbose way?
+const fn nonce_size<C: AeadCore>() -> usize {
+	std::mem::size_of::<Nonce<C>>()
+}
+
 #[cfg(test)]
 mod test {
-	use std::fmt::Write;
-
 	use bytes::BytesMut;
 	use chacha20poly1305::{AeadCore, ChaCha20Poly1305, KeyInit, aead::OsRng};
 
@@ -369,8 +334,6 @@ mod test {
 	fn init() {
 		let _ = env_logger::builder().is_test(true).try_init();
 	}
-	
-	const FAKE_HEADER: &[u8] = b"\r\n\r\n";
 
 	#[test]
 	fn test_payload() {
@@ -381,11 +344,11 @@ mod test {
 		let cipher = ChaCha20Poly1305::new(&key);
 		let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
 		println!("nonce len: {}", nonce.len());
-		assert_eq!(nonce.len(), NONCE_SIZE);
+		assert_eq!(nonce.len(), nonce_size::<ChaCha20Poly1305>());
 
 		let mut buf = BytesMut::with_capacity(1024);
 		let req = Req("example.com", 443);
-		write_msg(&mut buf, &cipher, FAKE_HEADER, &req);
+		write_msg(&mut buf, &cipher, EOH, &req);
 		let req_r: Req = read_msg(&mut buf, &cipher).unwrap();
 		assert_eq!(req, req_r);
 	}
@@ -404,14 +367,14 @@ mod test {
 				let mut buf = BytesMut::with_capacity(0x500);
 				assert_eq!(
 					Some(()),
-					client_handshake(&mut c, &cipher, &mut buf, "example.com", 443, FAKE_HEADER).await
+					client_handshake(&mut c, &cipher, &mut buf, "example.com", 443, EOH).await
 				);
 			},
 			async {
 				let mut buf = BytesMut::with_capacity(0x500);
 				assert_eq!(
 					Some(("example.com".to_owned(), 443)),
-					server_handshake(&mut s, &cipher, &mut buf, FAKE_HEADER).await
+					server_handshake(&mut s, &cipher, &mut buf, EOH).await
 				);
 			}
 		);
