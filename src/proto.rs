@@ -237,8 +237,8 @@ async fn enc1<C: AeadCore + AeadInPlace, E: AsyncWrite + Unpin, P: AsyncRead + U
 	// write nonce
 	(&mut buf[..nonce_size::<C>()]).copy_from_slice(&nonce);
 	// write length
-	// to do: xor it with nonce to make it look random?
-	(&mut buf[nonce_size::<C>()..]).copy_from_slice(&(payload.len() as u16).to_be_bytes());
+	let len = obfuscate(payload.len() as u16, &nonce).to_be_bytes();
+	(&mut buf[nonce_size::<C>()..]).copy_from_slice(&len);
 	buf.unsplit(payload);
 
 	encrypted
@@ -266,6 +266,7 @@ async fn dec1<C: AeadCore + AeadInPlace, P: AsyncWrite + Unpin, E: AsyncRead + U
 		.await
 		.map_err(|e| debug!("failed to read len: {}", e))
 		.ok()?;
+	let len = obfuscate(len, &nonce);
 	if len == 0 {
 		debug!("length = 0, unexpected");
 		return None;
@@ -343,6 +344,11 @@ pub async fn simplex<
 // is there a less verbose way?
 const fn nonce_size<C: AeadCore>() -> usize {
 	std::mem::size_of::<Nonce<C>>()
+}
+
+// make len look random
+fn obfuscate(a: u16, b: &[u8]) -> u16 {
+	a ^ u16::from_be_bytes([b[4 % b.len()], b[2 % b.len()]])
 }
 
 #[cfg(test)]
