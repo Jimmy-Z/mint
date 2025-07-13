@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use log::*;
 
 use chacha20poly1305::ChaCha20Poly1305 as Cipher;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, lookup_host};
 
 mod fake;
 mod key;
@@ -102,6 +102,7 @@ async fn server(key: &str, listen: &str, fake_header: &str) -> Option<()> {
 	info!("listening on {}", l.local_addr().unwrap());
 
 	while let Ok((mut s, r_addr)) = l.accept().await {
+		let _ = s.set_nodelay(true);
 		let cipher = cipher.clone();
 		let fake_header = fake_header.clone();
 		tokio::task::spawn_local(async move {
@@ -118,6 +119,7 @@ async fn server(key: &str, listen: &str, fake_header: &str) -> Option<()> {
 			else {
 				return;
 			};
+			let _ = u.set_nodelay(true);
 			duplex(&cipher, &mut u, &mut s).await;
 			debug!("connection ended: {} -> {}:{}", r_addr, addr, port);
 		});
@@ -126,31 +128,50 @@ async fn server(key: &str, listen: &str, fake_header: &str) -> Option<()> {
 	Some(())
 }
 
-async fn client(key: &str, listen: &str, upstream: &str, fake_header: &str) -> Option<()> {
+async fn client(key: &str, listen: &str, upstream_str: &str, fake_header: &str) -> Option<()> {
 	let fake_header = Rc::new(fake::get_fake_header(fake_header));
 	let cipher: Cipher = init_cipher(key)?;
 
-	let upstream: SocketAddr = upstream.parse().unwrap();
-	info!("server addr: {}", upstream);
+	let upstream: Vec<SocketAddr> = lookup_host(upstream_str)
+		.await
+		.inspect_err(|e| error!("failed to lookup {}", upstream_str))
+		.ok()?
+		.collect();
+	if upstream.len() == 0 {
+		error!("lookup {} yields no result", upstream_str);
+		return None;
+	}
+	info!(
+		"server addr: {}",
+		&upstream
+			.iter()
+			.map(SocketAddr::to_string)
+			.reduce(|a, b| a + &b)
+			.unwrap()
+	);
+	let upstream = Rc::new(upstream);
 
 	let l = TcpListener::bind(listen).await.unwrap();
 	info!("listening on {}", l.local_addr().unwrap());
 
 	while let Ok((mut s, r_addr)) = l.accept().await {
-		let cipher = cipher.clone();
+		let _ = s.set_nodelay(true);
 		let fake_header = fake_header.clone();
+		let cipher = cipher.clone();
+		let upstream = upstream.clone();
 		tokio::task::spawn_local(async move {
 			let mut buf = BytesMut::with_capacity(0x500);
 			let Some((addr, port)) = socks5::server_handshake(&mut s).await else {
 				return;
 			};
 			info!("{} -> {}:{}", r_addr, addr, port);
-			let Ok(mut u) = TcpStream::connect(upstream)
+			let Ok(mut u) = TcpStream::connect(&upstream as &[SocketAddr])
 				.await
 				.map_err(|e| error!("error connecting to upstream: {}", e))
 			else {
 				return;
 			};
+			let _ = u.set_nodelay(true);
 			let Some(()) = client_handshake(
 				&mut u,
 				&cipher,
