@@ -304,30 +304,36 @@ pub async fn duplex<
 	let (mut e_r, mut e_w) = split(encrypted);
 	tokio::join!(
 		async {
-			let mut buf = BytesMut::with_capacity(0x1000);
-			dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
-			dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
-			dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
-			drop(buf);
-			copy(&mut e_r, &mut p_w)
-				.await
-				.inspect_err(|e| debug!("error copying: {}", e))
-				.ok()?;
+			async {
+				let mut buf = BytesMut::with_capacity(0x1000);
+				dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
+				dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
+				dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
+				drop(buf);
+				copy(&mut e_r, &mut p_w)
+					.await
+					.inspect_err(|e| debug!("error copying: {}", e))
+					.ok()
+			}
+			.await;
 			p_w.shutdown()
 				.await
 				.inspect_err(|e| debug!("error shutting down: {}", e))
 				.ok()
 		},
 		async {
-			let mut buf = BytesMut::with_capacity(0x1000);
-			enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
-			enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
-			enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
-			drop(buf);
-			copy(&mut p_r, &mut e_w)
-				.await
-				.inspect_err(|e| debug!("error copying: {}", e))
-				.ok()?;
+			async {
+				let mut buf = BytesMut::with_capacity(0x1000);
+				enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
+				enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
+				enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
+				drop(buf);
+				copy(&mut p_r, &mut e_w)
+					.await
+					.inspect_err(|e| debug!("error copying: {}", e))
+					.ok()
+			}
+			.await;
 			e_w.shutdown()
 				.await
 				.inspect_err(|e| debug!("error shutting down: {}", e))
