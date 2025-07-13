@@ -8,8 +8,9 @@ after that, it's just plain TCP.
 
 in an eye-balling test, it consumes about 1/3 CPU compared to stunnel under the same load.
 
-so far it's just a PoC.
+it works for me, but no warranty.
 
 ### to do
 - timeout in handshake
 - timeout in socks5 handshake
+- calculate padding length
