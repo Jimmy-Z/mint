@@ -224,6 +224,7 @@ async fn enc1<C: AeadCore + AeadInPlace, E: AsyncWrite + Unpin, P: AsyncRead + U
 	}
 	let mut payload = buf.split_off(payload_offset);
 	if payload.is_empty() {
+		debug!("got 0 reading plain data, likely remote closed");
 		buf.unsplit(payload);
 		return None;
 	}
@@ -303,43 +304,40 @@ pub async fn duplex<
 	let (mut p_r, mut p_w) = split(plain);
 	let (mut e_r, mut e_w) = split(encrypted);
 	tokio::join!(
-		async {
-			async {
-				let mut buf = BytesMut::with_capacity(0x1000);
-				dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
-				dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
-				dec1(&mut buf, cipher, &mut p_w, &mut e_r).await?;
-				drop(buf);
-				copy(&mut e_r, &mut p_w)
-					.await
-					.inspect_err(|e| debug!("error copying: {}", e))
-					.ok()
-			}
-			.await;
-			p_w.shutdown()
-				.await
-				.inspect_err(|e| debug!("error shutting down: {}", e))
-				.ok()
-		},
-		async {
-			async {
-				let mut buf = BytesMut::with_capacity(0x1000);
-				enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
-				enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
-				enc1(&mut buf, cipher, &mut e_w, &mut p_r).await?;
-				drop(buf);
-				copy(&mut p_r, &mut e_w)
-					.await
-					.inspect_err(|e| debug!("error copying: {}", e))
-					.ok()
-			}
-			.await;
-			e_w.shutdown()
-				.await
-				.inspect_err(|e| debug!("error shutting down: {}", e))
-				.ok()
-		}
+		simplex(cipher, enc1, &mut e_w, &mut p_r),
+		simplex(cipher, dec1, &mut p_w, &mut e_r),
 	);
+}
+
+pub async fn simplex<
+	C: AeadCore + AeadInPlace,
+	F: AsyncFn(&mut BytesMut, &C, &mut W, &mut R) -> Option<()>,
+	W: AsyncWrite + Unpin,
+	R: AsyncRead + Unpin,
+>(
+	cipher: &C,
+	codec: F,
+	w: &mut W,
+	r: &mut R,
+) -> Option<()> {
+	// enclosed so I can use ? and still guarantee shutdown
+	// is there a better pattern?
+	async {
+		let mut buf = BytesMut::with_capacity(0x1000);
+		codec(&mut buf, cipher, w, r).await?;
+		codec(&mut buf, cipher, w, r).await?;
+		codec(&mut buf, cipher, w, r).await?;
+		drop(buf);
+		copy(r, w)
+			.await
+			.inspect_err(|e| debug!("error copying: {}", e))
+			.ok()
+	}
+	.await;
+	w.shutdown()
+		.await
+		.inspect_err(|e| debug!("error shutting down: {}", e))
+		.ok()
 }
 
 // is there a less verbose way?
